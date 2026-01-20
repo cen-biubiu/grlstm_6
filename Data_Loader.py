@@ -1,5 +1,3 @@
-# data_load.py
-# -*- coding: utf-8 -*-
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
@@ -108,6 +106,36 @@ def load_poi_neighbors(poi_file: str):
     data = np.load(poi_file, allow_pickle=True)
     return data["neighbors"]
 
+# 没有使用train_list
+# def load_traindata(train_file: str):
+#     """
+#     Required keys in train_file:
+#       train_idx:  [N] global trajectory indices
+#       train_pos:  [N, K] global positive trajectory indices
+#       train_prob: [N, K] probabilities
+#     Trajectories are loaded from args.tra_file (bj_tra.npy).
+#     """
+#     data = np.load(train_file, allow_pickle=True)
+
+#     train_idx = np.asarray(data["train_idx"], dtype=np.int64)
+#     train_pos = np.asarray(data["train_pos"], dtype=np.int64)
+#     train_prob = np.asarray(data["train_prob"], dtype=np.float32)
+
+#     # 🔑 从全量轨迹库加载
+#     tra_path = getattr(args, "tra_file", None)
+#     if tra_path is None:
+#         raise KeyError("args.tra_file must be set (path to bj_tra.npy)")
+
+#     tra_all = np.load(tra_path, allow_pickle=True)
+
+#     if train_idx.max(initial=-1) >= len(tra_all):
+#         raise IndexError(
+#             f"train_idx.max()={train_idx.max()} but len(tra_all)={len(tra_all)}"
+#         )
+
+#     train_x = tra_all[train_idx]   # ← 关键：这里才构建 train_list
+
+#     return train_x, train_idx, train_pos, train_prob
 
 def load_traindata(train_file: str):
     """
@@ -123,6 +151,7 @@ def load_traindata(train_file: str):
     train_pos = data["train_pos"]      # [N, K]
     train_prob = data["train_prob"]    # [N, K]
     return x, train_idx, train_pos, train_prob
+
 
 def load_valdata(val_file: str):
     """
@@ -155,11 +184,12 @@ def load_valdata(val_file: str):
             idx_key = k
             break
     if idx_key is None:
-        raise KeyError(f"Cannot find trajectory list nor val_idx/test_idx in {val_file}. keys={list(data.keys())}")
+        raise KeyError(
+            f"Cannot find trajectory list nor val_idx/test_idx in {val_file}. keys={list(data.keys())}"
+        )
 
     idx_global = np.asarray(data[idx_key], dtype=np.int64)
 
-    # 你生成数据时的全量轨迹库是 TRA_FILE = bj_tra.npy
     tra_path = getattr(args, "tra_file", None)
     if tra_path is None:
         tra_path = getattr(args, "raw_tra_file", None)
@@ -180,34 +210,6 @@ def load_valdata(val_file: str):
     x = tra_all[idx_global]
     y = idx_global
     return x, y
-
-
-# def load_valdata(val_file: str):
-#     """
-#     Try common key names. Adjust here if你的npz字段不同。
-#     Returns:
-#       x: trajectories
-#       y: optional labels/indices (can be None)
-#     """
-#     data = np.load(val_file, allow_pickle=True)
-
-#     # trajectory
-#     if "val_list" in data:
-#         x = data["val_list"]
-#     elif "test_list" in data:
-#         x = data["test_list"]
-#     elif "train_list" in data:
-#         x = data["train_list"]
-#     else:
-#         raise KeyError(f"Cannot find trajectory list in {val_file}. keys={list(data.keys())}")
-
-#     # label / index (optional)
-#     y = None
-#     for k in ["val_y", "val_idx", "test_y", "test_idx", "y_idx", "y"]:
-#         if k in data:
-#             y = data[k]
-#             break
-#     return x, y
 
 
 # ----------------------------
@@ -266,7 +268,6 @@ def TrainValueDataLoader(train_file: str, poi_file: str, batchsize: int):
     tra_len = int(train_x.shape[0])
     device = _auto_device()
 
-    # global id -> local row
     global2local = {int(g): int(i) for i, g in enumerate(train_idx_global)}
 
     MAX_T = int(getattr(args, "max_seq_len", 1024))
@@ -287,7 +288,6 @@ def TrainValueDataLoader(train_file: str, poi_file: str, batchsize: int):
             s = float(prob.sum())
             prob = (prob / s) if s > 0 else None
 
-        # try K times sampling
         for _ in range(K):
             jg = int(rng.choice(pos_global_row, p=prob)) if prob is not None else int(rng.choice(pos_global_row))
             if jg == int(anchor_global):
@@ -296,7 +296,6 @@ def TrainValueDataLoader(train_file: str, poi_file: str, batchsize: int):
             if jl is not None and jl != anchor_local:
                 return jl
 
-        # fallback: sequential scan
         for jg in pos_global_row:
             jg = int(jg)
             if jg == int(anchor_global):
@@ -305,22 +304,18 @@ def TrainValueDataLoader(train_file: str, poi_file: str, batchsize: int):
             if jl is not None and jl != anchor_local:
                 return jl
 
-        # final fallback: random local
         jl = int(rng.integers(0, tra_len))
         while jl == anchor_local:
             jl = int(rng.integers(0, tra_len))
         return jl
 
     def collate_fn_neg(data_tuple):
-        # sort by traj length desc
         data_tuple.sort(key=lambda x: len(x[0]), reverse=True)
 
-        # anchor trajs (truncated)
         data = [torch.LongTensor(_truncate_seq(sq[0], MAX_T, KEEP)) for sq in data_tuple]
         idx_list = [int(sq[3]) for sq in data_tuple]
-        idx_global_list = [int(sq[4]) for sq in data_tuple]
+        idx_global_list = [int(sq[4]) for sq in data_tuple]  # optional
 
-        # sample 1 pos traj per anchor
         label_indices = []
         for sq in data_tuple:
             pos_local = _sample_pos_local(
@@ -333,7 +328,6 @@ def TrainValueDataLoader(train_file: str, poi_file: str, batchsize: int):
 
         data_label = [torch.LongTensor(_truncate_seq(train_x[d], MAX_T, KEEP)) for d in label_indices]
 
-        # neg traj sampling
         data_neg = []
         for b in range(len(data)):
             neg = int(rng.integers(0, tra_len))
@@ -394,7 +388,7 @@ def TrainValueDataLoader(train_file: str, poi_file: str, batchsize: int):
             traj_poi_pos.append(torch.LongTensor(pos))
             traj_poi_neg.append(torch.LongTensor(neg))
 
-        # semantic packs (build on CPU)
+        # semantic packs (CPU)
         semantic_anchor = _build_semantic_pack(data, semantic_lookup[0], semantic_lookup[1])
         semantic_pos = _build_semantic_pack(data_label, semantic_lookup[0], semantic_lookup[1])
         semantic_neg = _build_semantic_pack(data_neg, semantic_lookup[0], semantic_lookup[1])
@@ -430,7 +424,6 @@ def TrainValueDataLoader(train_file: str, poi_file: str, batchsize: int):
             traj_poi_pos_tensor, traj_poi_neg_tensor,
             poi_pos_tensor, poi_neg_tensor,
             semantic_anchor_dev, semantic_pos_dev, semantic_neg_dev,
-            # idx_global_list,  # optional: keep global ids if you need
         )
 
     dataset = DataLoader(
@@ -457,12 +450,10 @@ def TrainDataValLoader(train_file: str, batchsize: int):
     MAX_T = int(getattr(args, "max_seq_len", 1024))
     KEEP = "last"
 
-    # dummy pos/prob just to reuse MyData signature
     dummy_pos = np.zeros((len(train_x), 1), dtype=np.int64)
     dummy_prob = np.zeros((len(train_x), 1), dtype=np.float32)
 
     def collate_fn_eval(data_tuple):
-        # data_tuple: (traj, pos_row, prob_row, local_idx, global_idx)
         data_tuple.sort(key=lambda x: len(x[0]), reverse=True)
 
         data = [torch.LongTensor(_truncate_seq(sq[0], MAX_T, KEEP)) for sq in data_tuple]
@@ -502,7 +493,6 @@ def ValValueDataLoader(val_file: str, batchsize: int):
     KEEP = "last"
 
     def collate_fn_eval(batch):
-        # batch: (traj, y, local_idx)
         batch.sort(key=lambda x: len(x[0]), reverse=True)
 
         data = [torch.LongTensor(_truncate_seq(b[0], MAX_T, KEEP)) for b in batch]

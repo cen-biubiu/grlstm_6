@@ -64,7 +64,7 @@ class GRLSTM(nn.Module):
 
         logging.info("Initializing model: latent_dim=%d", self.latent_dim)
 
-        # Fixed fusion weights (aligned with ground-truth)
+        # Fixed fusion weights
         alpha_spa = float(getattr(args, "alpha_spa", 0.3))
         delta_sem = float(getattr(args, "delta_sem", 0.5))
         s = max(alpha_spa + delta_sem, 1e-8)
@@ -73,7 +73,6 @@ class GRLSTM(nn.Module):
 
         self.register_buffer("w_sem", torch.tensor(w_sem, dtype=torch.float32))
         self.register_buffer("w_spa", torch.tensor(w_spa, dtype=torch.float32))
-
         logging.info("Fixed fusion weights: w_sem=%.4f, w_spa=%.4f", w_sem, w_spa)
 
         # Semantic meta
@@ -94,7 +93,12 @@ class GRLSTM(nn.Module):
             torch.tensor(poi_features, dtype=torch.float32),
             freeze=False,
         )
-        self.rel_embedding = nn.Embedding(self.rel_vocab, self.latent_dim, padding_idx=None)
+        # padding_idx=None 没必要写；但保留你原意
+        self.rel_embedding = nn.Embedding(self.rel_vocab, self.latent_dim)
+
+        # 🔥 预计算 rel_bias（修复 device mismatch 的关键在这里）
+        self._precompute_rel_bias()
+
         self.spatial_pos_enc = PositionalEncoding(self.latent_dim, max_len=20000)
 
         # Semantic branch
@@ -175,20 +179,49 @@ class GRLSTM(nn.Module):
             graph[nid] = top
         return graph
 
-    def _build_padding_mask(self, lengths, max_len):
-        lens = torch.as_tensor(lengths, device=self.device)
-        return torch.arange(max_len, device=self.device).unsqueeze(0) >= lens.unsqueeze(1)
+    # ✅ 更稳：mask 构造跟随输入 device，不依赖 self.device 字段
+    def _build_padding_mask(self, lengths, max_len, device: Optional[torch.device] = None):
+        dev = device if device is not None else self.rel_bias_cache.device
+        lens = torch.as_tensor(lengths, device=dev)
+        return torch.arange(max_len, device=dev).unsqueeze(0) >= lens.unsqueeze(1)
 
     def _masked_avg_pool(self, seq: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
-        """
-        seq: [B, T, D]
-        padding_mask: [B, T] True means padding
-        return: [B, D]
-        """
         valid = (~padding_mask).float().unsqueeze(-1)
         seq = seq * valid
         denom = valid.sum(dim=1).clamp(min=1.0)
         return seq.sum(dim=1) / denom
+
+    def _precompute_rel_bias(self):
+        """
+        🔥 优化1：预计算所有节点的关系偏置（只在初始化时执行一次）
+        ✅ 修复：切断 autograd（no_grad + detach），避免 backward 时 CPU/CUDA 混用
+        """
+        logging.info("[Model] Precomputing rel_bias for %d nodes...", self.nodes)
+
+        # cache 放 CPU，节省显存；buffer 会在 model.to(device) 时自动迁移
+        rel_bias = torch.zeros((self.nodes, self.latent_dim), dtype=torch.float32)
+
+        with torch.no_grad():
+            # 关键：detach，断开计算图；并在 CPU 上取 weight
+            rel_w = self.rel_embedding.weight.detach().cpu()  # [rel_vocab, D]
+
+            for nid in range(self.nodes):
+                neighbors = self.topk_graph.get(nid, [])
+                if not neighbors:
+                    continue
+
+                rel_ids = [rel for _, rel in neighbors]
+                if len(rel_ids) > 0:
+                    rel_ids_t = torch.tensor(rel_ids, dtype=torch.long)  # CPU tensor
+                    rel_bias[nid] = rel_w[rel_ids_t].mean(dim=0)
+
+        # 注册为 buffer：常量，不参与梯度
+        self.register_buffer("rel_bias_cache", rel_bias, persistent=True)
+
+        # 安全断言：必须不需要梯度
+        assert not self.rel_bias_cache.requires_grad, "rel_bias_cache should be a constant buffer (requires_grad=False)."
+
+        logging.info("[Model] Precomputed rel_bias: shape=%s", rel_bias.shape)
 
     def _encode_spatial(
         self,
@@ -200,63 +233,55 @@ class GRLSTM(nn.Module):
         poi_lengths: Optional[List[int]] = None,
         traj_poi_lengths: Optional[List[int]] = None,
     ):
+        dev = nodes.device
+
         if mask is None:
-            mask = self._build_padding_mask(lengths, nodes.size(1))
+            mask = self._build_padding_mask(lengths, nodes.size(1), device=dev)
 
         valid = nodes.masked_select(~mask)
 
         if poi is not None:
             if poi_lengths is not None:
-                poi_mask = self._build_padding_mask(poi_lengths, poi.size(1))
+                poi_mask = self._build_padding_mask(poi_lengths, poi.size(1), device=poi.device)
             else:
-                poi_mask = torch.zeros_like(poi, dtype=torch.bool)
+                poi_mask = torch.zeros_like(poi, dtype=torch.bool, device=poi.device)
             valid = torch.cat([valid, poi.masked_select(~poi_mask)], dim=0)
 
         if traj_poi is not None:
             if traj_poi_lengths is not None:
-                traj_mask = self._build_padding_mask(traj_poi_lengths, traj_poi.size(1))
+                traj_mask = self._build_padding_mask(traj_poi_lengths, traj_poi.size(1), device=traj_poi.device)
             else:
-                traj_mask = torch.zeros_like(traj_poi, dtype=torch.bool)
+                traj_mask = torch.zeros_like(traj_poi, dtype=torch.bool, device=traj_poi.device)
             valid = torch.cat([valid, traj_poi.masked_select(~traj_mask)], dim=0)
 
         unique_nodes = torch.unique(valid)
         if unique_nodes.numel() == 0:
-            unique_nodes = torch.tensor([0], device=self.device)
+            unique_nodes = torch.tensor([0], device=dev, dtype=torch.long)
 
         edges: List[Tuple[int, int, int]] = []
-        node_rel_sum = {}
-
         for nid in unique_nodes.tolist():
             edges.append((nid, nid, self.self_loop_rel))
-
-            rel_list = []
             for nb, rel in self.topk_graph.get(nid, []):
                 edges.append((nb, nid, rel))
-                rel_list.append(rel)
-            if rel_list:
-                node_rel_sum[nid] = rel_list
 
         if not edges:
             edges = [(0, 0, self.self_loop_rel)]
 
-        src = torch.as_tensor([e[0] for e in edges], device=self.device, dtype=torch.long)
-        dst = torch.as_tensor([e[1] for e in edges], device=self.device, dtype=torch.long)
-        rel = torch.as_tensor([e[2] for e in edges], device=self.device, dtype=torch.long)
+        src = torch.as_tensor([e[0] for e in edges], device=dev, dtype=torch.long)
+        dst = torch.as_tensor([e[1] for e in edges], device=dev, dtype=torch.long)
+        rel = torch.as_tensor([e[2] for e in edges], device=dev, dtype=torch.long)
 
-        rel_bias = torch.zeros((self.nodes, self.latent_dim), device=self.device)
-        for nid, rel_ids in node_rel_sum.items():
-            rel_embs = self.rel_embedding(torch.tensor(rel_ids, device=self.device))
-            rel_bias[nid] = rel_embs.mean(dim=0)
+        # ✅ 关键：rel_bias_cache 显式搬到 dev（避免偶发不一致）
+        node_feats = self.node_embedding.weight.to(dev) + self.rel_bias_cache.to(dev)
 
-        node_feats = self.node_embedding.weight.to(self.device) + rel_bias
-        rel_emb = self.rel_embedding(rel)
+        rel_emb = self.rel_embedding(rel)  # rel 在 dev 上，所以 rel_emb 在 dev 上
         messages = node_feats[src] + rel_emb
 
         agg = torch.zeros_like(node_feats)
         agg.index_add_(0, dst, messages)
 
-        deg = torch.zeros(self.nodes, device=self.device)
-        deg.index_add_(0, dst, torch.ones(len(dst), device=self.device))
+        deg = torch.zeros(self.nodes, device=dev)
+        deg.index_add_(0, dst, torch.ones(len(dst), device=dev))
         deg = deg.clamp(min=1).unsqueeze(-1)
         agg = agg / deg
 
@@ -264,11 +289,10 @@ class GRLSTM(nn.Module):
         spatial_features = F.normalize(spatial_features, p=2, dim=-1) * np.sqrt(self.latent_dim)
 
         spatial_seq = spatial_features[nodes]
-        
-        # Return sequence representations for POI-level contrast
+
         poi_seq = spatial_features[poi] if poi is not None else None
         traj_poi_seq = spatial_features[traj_poi] if traj_poi is not None else None
-        
+
         return spatial_seq, poi_seq, traj_poi_seq
 
     def _semantic_from_nodes(self, nodes: torch.Tensor, lengths):
@@ -277,9 +301,28 @@ class GRLSTM(nn.Module):
             "tokens": self.subclass_lookup[nodes],
             "segments": self.category_lookup[nodes],
             "positions": positions,
-            "padding_mask": self._build_padding_mask(lengths, nodes.size(1)),
+            "padding_mask": self._build_padding_mask(lengths, nodes.size(1), device=nodes.device),
             "lengths": lengths,
         }
+
+    def encode_poi_batch(self, poi_batch: torch.Tensor, poi_lengths):
+        """
+        🔥 新增方法：单独编码POI序列（用于对比学习）
+        避免重复forward整个轨迹
+        """
+        poi_batch = poi_batch.to(self.device)
+        mask = self._build_padding_mask(poi_lengths, poi_batch.size(1), device=poi_batch.device)
+
+        spatial_seq, _, _ = self._encode_spatial(
+            poi_batch,
+            poi_lengths,
+            poi=None,
+            traj_poi=None,
+            mask=mask
+        )
+
+        spatial_seq = self.spatial_pos_enc(spatial_seq)
+        return self._masked_avg_pool(spatial_seq, mask)
 
     def forward(
         self,
@@ -292,9 +335,8 @@ class GRLSTM(nn.Module):
         traj_poi_lengths: Optional[List[int]] = None,
     ):
         batch_nodes = batch_nodes.to(self.device)
-        mask = self._build_padding_mask(batch_lengths, batch_nodes.size(1))
+        mask = self._build_padding_mask(batch_lengths, batch_nodes.size(1), device=batch_nodes.device)
 
-        # Spatial encoding
         spatial_seq, poi_seq, traj_poi_seq = self._encode_spatial(
             batch_nodes,
             batch_lengths,
@@ -306,14 +348,13 @@ class GRLSTM(nn.Module):
         )
         spatial_seq = self.spatial_pos_enc(spatial_seq)
 
-        # Semantic encoding
         if semantic is None:
             semantic = self._semantic_from_nodes(batch_nodes, batch_lengths)
 
-        tokens = semantic["tokens"].to(self.device)
-        segments = semantic["segments"].to(self.device)
-        positions = semantic["positions"].to(self.device)
-        sem_mask = semantic.get("padding_mask", mask).to(self.device)
+        tokens = semantic["tokens"].to(batch_nodes.device)
+        segments = semantic["segments"].to(batch_nodes.device)
+        positions = semantic["positions"].to(batch_nodes.device)
+        sem_mask = semantic.get("padding_mask", mask).to(batch_nodes.device)
 
         positions = positions.clamp(max=self.pos_embedding.num_embeddings - 1)
 
@@ -322,7 +363,6 @@ class GRLSTM(nn.Module):
 
         semantic_out = self.semantic_encoder(sem_input, src_key_padding_mask=sem_mask)
 
-        # Dual cross-attention
         sem_attn, _ = self.co_attn_sem(
             semantic_out, spatial_seq, spatial_seq,
             key_padding_mask=mask,
@@ -338,29 +378,32 @@ class GRLSTM(nn.Module):
         fused = self.fuse_linear(combined)
         fused = self.fuse_norm(fused + self.fuse_dropout(weighted))
 
-        # FFN block
         ffn_out = self.fusion_ffn(fused)
         fused = self.fusion_ffn_norm(fused + ffn_out)
 
-        # CRITICAL FIX: Use masked average pooling for trajectory representation
         traj_repr = self._masked_avg_pool(fused, mask)
-        
-        # Also pool POI-level sequences for loss computation
+
         poi_emb_pooled = None
         traj_poi_emb_pooled = None
-        
+
         if poi_seq is not None:
-            poi_mask = self._build_padding_mask(poi_lengths, poi_seq.size(1)) if poi_lengths else mask
+            if poi_lengths is None:
+                poi_mask = mask
+            else:
+                poi_mask = self._build_padding_mask(poi_lengths, poi_seq.size(1), device=poi_seq.device)
             poi_emb_pooled = self._masked_avg_pool(poi_seq, poi_mask)
-            
+
         if traj_poi_seq is not None:
-            traj_poi_mask = self._build_padding_mask(traj_poi_lengths, traj_poi_seq.size(1)) if traj_poi_lengths else mask
+            if traj_poi_lengths is None:
+                traj_poi_mask = mask
+            else:
+                traj_poi_mask = self._build_padding_mask(traj_poi_lengths, traj_poi_seq.size(1), device=traj_poi_seq.device)
             traj_poi_emb_pooled = self._masked_avg_pool(traj_poi_seq, traj_poi_mask)
 
         return {
-            "traj_repr": traj_repr,  # [B, D] - pooled
-            "poi_emb": poi_emb_pooled,  # [B, D] - pooled
-            "traj_poi_emb": traj_poi_emb_pooled,  # [B, D] - pooled
-            "fused_seq": fused,  # [B, T, D] - sequence (for future use)
+            "traj_repr": traj_repr,
+            "poi_emb": poi_emb_pooled,
+            "traj_poi_emb": traj_poi_emb_pooled,
+            "fused_seq": fused,
             "mask": mask,
         }

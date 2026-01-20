@@ -36,7 +36,9 @@ def train():
         lr=args.lr,
         save_epoch_int=args.save_epoch_int,
         model_folder=args.save_folder,
-        device=device
+        device=device,
+        grad_accum_steps=args.grad_accum_steps,
+
     )
 
     trainer.train()

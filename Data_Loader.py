@@ -7,13 +7,142 @@ from torch.utils.data import Dataset, DataLoader
 
 from pars_args import args
 
-# semantic cache: (semantic_file, num_nodes) -> (category_lookup, subclass_lookup, category_vocab, subclass_vocab)
+# 导入增强器
+import sys
+import os
+sys.path.append(os.path.dirname(__file__))
+
+# semantic cache
 _SEMANTIC_CACHE: Dict[Tuple[str, int], Tuple[np.ndarray, np.ndarray, int, int]] = {}
 
 
-# ----------------------------
-# Semantic utils
-# ----------------------------
+# ==================== 增强器定义 ====================
+
+class TrajectoryAugmentor:
+    """轻量级增强器 (核心功能)"""
+    
+    def __init__(
+        self,
+        topk_graph: Dict[int, List[Tuple[int, int]]],
+        category_lookup: np.ndarray,
+        neighbors_spatial: np.ndarray,
+        num_nodes: int,
+        seed: int = 42
+    ):
+        self.topk_graph = topk_graph
+        self.category_lookup = category_lookup
+        self.neighbors_spatial = neighbors_spatial
+        self.num_nodes = num_nodes
+        self.rng = np.random.default_rng(seed)
+    
+    def neighbor_substitution(self, traj: np.ndarray, ratio: float = 0.3) -> np.ndarray:
+        """邻居替换"""
+        traj = traj.copy()
+        L = len(traj)
+        num_replace = max(1, int(L * ratio))
+        replace_indices = self.rng.choice(L, size=num_replace, replace=False)
+        
+        for idx in replace_indices:
+            poi = int(traj[idx])
+            neighbors = self.topk_graph.get(poi, [])
+            if neighbors:
+                new_poi, _ = neighbors[self.rng.integers(0, len(neighbors))]
+                traj[idx] = new_poi
+        return traj
+    
+    def poi_generalization(self, traj: np.ndarray, ratio: float = 0.2) -> np.ndarray:
+        """POI泛化"""
+        traj = traj.copy()
+        L = len(traj)
+        num_replace = max(1, int(L * ratio))
+        replace_indices = self.rng.choice(L, size=num_replace, replace=False)
+        
+        for idx in replace_indices:
+            poi = int(traj[idx])
+            category = self.category_lookup[poi]
+            same_category = np.where(self.category_lookup == category)[0]
+            
+            if len(same_category) > 1:
+                candidates = same_category[same_category != poi]
+                if len(candidates) > 0:
+                    traj[idx] = self.rng.choice(candidates)
+        return traj
+    
+    def spatial_jittering(self, traj: np.ndarray, ratio: float = 0.25) -> np.ndarray:
+        """空间抖动"""
+        traj = traj.copy()
+        L = len(traj)
+        num_jitter = max(1, int(L * ratio))
+        jitter_indices = self.rng.choice(L, size=num_jitter, replace=False)
+        
+        for idx in jitter_indices:
+            poi = int(traj[idx])
+            spatial_neighbors = self.neighbors_spatial[poi]
+            if len(spatial_neighbors) > 0:
+                traj[idx] = self.rng.choice(spatial_neighbors)
+        return traj
+    
+    def temporal_resampling(
+        self, 
+        traj: np.ndarray, 
+        scale_range: Tuple[float, float] = (0.7, 1.3)
+    ) -> np.ndarray:
+        """时间重采样"""
+        L = len(traj)
+        scale = self.rng.uniform(*scale_range)
+        new_length = max(2, int(L * scale))
+        new_indices = np.linspace(0, L - 1, new_length)
+        resampled = [traj[int(np.round(idx))] for idx in new_indices]
+        return np.array(resampled)
+    
+    def subsequence_sampling(self, traj: np.ndarray, ratio: float = 0.7) -> np.ndarray:
+        """子序列提取"""
+        L = len(traj)
+        keep_length = max(2, int(L * ratio))
+        start = self.rng.integers(0, L - keep_length + 1)
+        return traj[start:start + keep_length].copy()
+    
+    def order_perturbation(self, traj: np.ndarray, window_size: int = 3) -> np.ndarray:
+        """顺序扰动"""
+        traj = traj.copy()
+        L = len(traj)
+        if L < window_size:
+            return traj
+        start = self.rng.integers(0, L - window_size + 1)
+        window = traj[start:start + window_size].copy()
+        self.rng.shuffle(window)
+        traj[start:start + window_size] = window
+        return traj
+    
+    def augment_spatial(self, traj: np.ndarray, strategy: str = 'random') -> np.ndarray:
+        """空间增强 (随机选择策略)"""
+        if strategy == 'random':
+            strategy = self.rng.choice(['neighbor', 'generalize', 'jitter'])
+        
+        if strategy == 'neighbor':
+            return self.neighbor_substitution(traj, ratio=0.3)
+        elif strategy == 'generalize':
+            return self.poi_generalization(traj, ratio=0.2)
+        elif strategy == 'jitter':
+            return self.spatial_jittering(traj, ratio=0.25)
+        return traj.copy()
+    
+    def augment_temporal(self, traj: np.ndarray, strategy: str = 'random') -> np.ndarray:
+        """时间增强 (随机选择策略)"""
+        if strategy == 'random':
+            strategy = self.rng.choice(['resample', 'subsequence', 'perturb'])
+        
+        if strategy == 'resample':
+            return self.temporal_resampling(traj)
+        elif strategy == 'subsequence':
+            return self.subsequence_sampling(traj, ratio=0.7)
+        elif strategy == 'perturb':
+            return self.order_perturbation(traj, window_size=3)
+        return traj.copy()
+
+
+# ==================== Semantic utils ====================
+
 def load_semantic_info(semantic_file: str, num_nodes: int):
     key = (semantic_file, num_nodes)
     if key in _SEMANTIC_CACHE:
@@ -36,11 +165,10 @@ def load_semantic_info(semantic_file: str, num_nodes: int):
             max_cat = max(max_cat, cat)
             max_sub = max(max_sub, sub)
 
-            # shift by 1 (0 reserved for padding)
             category_lookup[nid] = cat + 1
             subclass_lookup[nid] = sub + 1
 
-    category_vocab = max_cat + 2  # +1 for padding, +1 for shift
+    category_vocab = max_cat + 2
     subclass_vocab = max_sub + 2
 
     _SEMANTIC_CACHE[key] = (category_lookup, subclass_lookup, category_vocab, subclass_vocab)
@@ -84,7 +212,7 @@ def _build_semantic_pack(
         "segments": segments,
         "positions": positions,
         "padding_mask": padding_mask,
-        "lengths": lengths,  # keep python list
+        "lengths": lengths,
     }
 
 
@@ -99,71 +227,24 @@ def _auto_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ----------------------------
-# IO
-# ----------------------------
+# ==================== IO ====================
+
 def load_poi_neighbors(poi_file: str):
     data = np.load(poi_file, allow_pickle=True)
     return data["neighbors"]
 
-# 没有使用train_list
-# def load_traindata(train_file: str):
-#     """
-#     Required keys in train_file:
-#       train_idx:  [N] global trajectory indices
-#       train_pos:  [N, K] global positive trajectory indices
-#       train_prob: [N, K] probabilities
-#     Trajectories are loaded from args.tra_file (bj_tra.npy).
-#     """
-#     data = np.load(train_file, allow_pickle=True)
-
-#     train_idx = np.asarray(data["train_idx"], dtype=np.int64)
-#     train_pos = np.asarray(data["train_pos"], dtype=np.int64)
-#     train_prob = np.asarray(data["train_prob"], dtype=np.float32)
-
-#     # 🔑 从全量轨迹库加载
-#     tra_path = getattr(args, "tra_file", None)
-#     if tra_path is None:
-#         raise KeyError("args.tra_file must be set (path to bj_tra.npy)")
-
-#     tra_all = np.load(tra_path, allow_pickle=True)
-
-#     if train_idx.max(initial=-1) >= len(tra_all):
-#         raise IndexError(
-#             f"train_idx.max()={train_idx.max()} but len(tra_all)={len(tra_all)}"
-#         )
-
-#     train_x = tra_all[train_idx]   # ← 关键：这里才构建 train_list
-
-#     return train_x, train_idx, train_pos, train_prob
 
 def load_traindata(train_file: str):
-    """
-    Required keys:
-      train_list: [N] trajectories (each is a list/array of poi ids)
-      train_idx:  [N] global id per trajectory
-      train_pos:  [N, K] global positive candidates
-      train_prob: [N, K] sampling probability per candidate (float)
-    """
     data = np.load(train_file, allow_pickle=True)
     x = data["train_list"]
-    train_idx = data["train_idx"]      # [N]
-    train_pos = data["train_pos"]      # [N, K]
-    train_prob = data["train_prob"]    # [N, K]
+    train_idx = data["train_idx"]
+    train_pos = data["train_pos"]
+    train_prob = data["train_prob"]
     return x, train_idx, train_pos, train_prob
 
 
 def load_valdata(val_file: str):
-    """
-    支持两种验证文件：
-
-    A) val_file 直接带轨迹: val_list / test_list / train_list
-    B) val_file 是 split 文件: 只有 val_idx / test_idx 等全局索引
-       此时轨迹要从 args.tra_file (bj_tra.npy) 或 args.raw_tra_file 读取。
-    """
     data = np.load(val_file, allow_pickle=True)
-
-    # ---------- Case A: val_file 自带轨迹 ----------
     if "val_list" in data:
         x = data["val_list"]
         y = data["val_idx"] if "val_idx" in data else None
@@ -177,49 +258,30 @@ def load_valdata(val_file: str):
         y = data["train_idx"] if "train_idx" in data else None
         return x, y
 
-    # ---------- Case B: split 文件：用全量轨迹库取 ----------
     idx_key = None
     for k in ["val_idx", "test_idx"]:
         if k in data:
             idx_key = k
             break
     if idx_key is None:
-        raise KeyError(
-            f"Cannot find trajectory list nor val_idx/test_idx in {val_file}. keys={list(data.keys())}"
-        )
+        raise KeyError(f"Cannot find trajectory list nor val_idx/test_idx in {val_file}")
 
     idx_global = np.asarray(data[idx_key], dtype=np.int64)
-
     tra_path = getattr(args, "tra_file", None)
     if tra_path is None:
         tra_path = getattr(args, "raw_tra_file", None)
-
     if tra_path is None:
-        raise KeyError(
-            f"{val_file} is a split file ({idx_key} exists), but args.tra_file/raw_tra_file is not set. "
-            f"Please set it to bj_tra.npy."
-        )
+        raise KeyError(f"{val_file} is a split file, but args.tra_file is not set")
 
     tra_all = np.load(tra_path, allow_pickle=True)
-    if idx_global.max(initial=-1) >= len(tra_all):
-        raise IndexError(
-            f"{idx_key}.max()={int(idx_global.max())} but len(tra_all)={len(tra_all)} from {tra_path}. "
-            f"Trajectory base file mismatch."
-        )
-
     x = tra_all[idx_global]
     y = idx_global
     return x, y
 
 
-# ----------------------------
-# Dataset
-# ----------------------------
+# ==================== Dataset ====================
+
 class MyData(Dataset):
-    """
-    label 不再是一个 int，而是 (pos_global_row, prob_row, anchor_local_idx, anchor_global_idx)
-    __getitem__ returns: (traj, pos_global_row, prob_row, local_idx, global_idx)
-    """
     def __init__(self, data, pos_global, prob, idx_global):
         self.data = data
         self.pos_global = pos_global
@@ -234,7 +296,6 @@ class MyData(Dataset):
 
 
 class EvalTrajDS(Dataset):
-    """for val/test: returns (traj, y(optional), local_idx)"""
     def __init__(self, x, y=None):
         self.x = x
         self.y = y
@@ -247,18 +308,16 @@ class EvalTrajDS(Dataset):
         return self.x[i], yi, i
 
 
-# ----------------------------
-# Main loaders
-# ----------------------------
+# ==================== Main loaders ====================
+
 def TrainValueDataLoader(train_file: str, poi_file: str, batchsize: int):
     """
-    Train loader with:
-      - trajectory-level positive sampling (from train_pos/train_prob, global->local mapping)
-      - trajectory-level negative sampling
-      - poi-level positive/negative sampling (neighbors)
-      - traj-internal neighbor pos/neg
-      - semantic packs for anchor/pos/neg
-      - optional truncation by args.max_seq_len (default 1024), keep last
+    🔥 训练loader (增强版)
+    
+    新增功能:
+    - 空间增强轨迹
+    - 时间增强轨迹
+    - 返回三元组: (anchor, spatial_aug, temporal_aug)
     """
     semantic_lookup = load_semantic_info(args.semantic_file, args.nodes)
     args.category_vocab, args.subclass_vocab = semantic_lookup[2], semantic_lookup[3]
@@ -274,6 +333,32 @@ def TrainValueDataLoader(train_file: str, poi_file: str, batchsize: int):
     KEEP = "last"
 
     rng = np.random.default_rng(int(getattr(args, "seed", 123)))
+    
+    # 🔥 构建图结构 (用于增强)
+    from collections import defaultdict
+    topk_graph = defaultdict(list)
+    kg_file = getattr(args, "kg_multi_rel_file", None)
+    if kg_file and os.path.exists(kg_file):
+        with open(kg_file, 'r') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    u, v, r = line.strip().split()
+                    u, v, r = int(u), int(v), int(r)
+                    topk_graph[u].append((v, r))
+                    topk_graph[v].append((u, r))
+                except:
+                    pass
+    
+    # 🔥 创建增强器
+    augmentor = TrajectoryAugmentor(
+        topk_graph=topk_graph,
+        category_lookup=semantic_lookup[0],
+        neighbors_spatial=neighbors,
+        num_nodes=args.nodes,
+        seed=args.seed
+    )
 
     def _sample_pos_local(pos_global_row, prob_row, anchor_local, anchor_global):
         pos_global_row = np.asarray(pos_global_row, dtype=np.int64)
@@ -312,22 +397,39 @@ def TrainValueDataLoader(train_file: str, poi_file: str, batchsize: int):
     def collate_fn_neg(data_tuple):
         data_tuple.sort(key=lambda x: len(x[0]), reverse=True)
 
+        # 🔥 原始轨迹
         data = [torch.LongTensor(_truncate_seq(sq[0], MAX_T, KEEP)) for sq in data_tuple]
         idx_list = [int(sq[3]) for sq in data_tuple]
-        idx_global_list = [int(sq[4]) for sq in data_tuple]  # optional
+        idx_global_list = [int(sq[4]) for sq in data_tuple]
 
+        # 🔥 增强轨迹
+        use_aug = getattr(args, 'use_augmentation', True)
+        if use_aug:
+            data_spatial_aug = []
+            data_temporal_aug = []
+            
+            for sq in data_tuple:
+                traj = sq[0]
+                # 空间增强
+                traj_spa = augmentor.augment_spatial(traj)
+                data_spatial_aug.append(torch.LongTensor(_truncate_seq(traj_spa, MAX_T, KEEP)))
+                # 时间增强
+                traj_temp = augmentor.augment_temporal(traj)
+                data_temporal_aug.append(torch.LongTensor(_truncate_seq(traj_temp, MAX_T, KEEP)))
+        else:
+            # 不使用增强
+            data_spatial_aug = [d.clone() for d in data]
+            data_temporal_aug = [d.clone() for d in data]
+
+        # 正样本
         label_indices = []
         for sq in data_tuple:
-            pos_local = _sample_pos_local(
-                pos_global_row=sq[1],
-                prob_row=sq[2],
-                anchor_local=int(sq[3]),
-                anchor_global=int(sq[4]),
-            )
+            pos_local = _sample_pos_local(sq[1], sq[2], int(sq[3]), int(sq[4]))
             label_indices.append(pos_local)
 
         data_label = [torch.LongTensor(_truncate_seq(train_x[d], MAX_T, KEEP)) for d in label_indices]
 
+        # 负样本
         data_neg = []
         for b in range(len(data)):
             neg = int(rng.integers(0, tra_len))
@@ -335,11 +437,14 @@ def TrainValueDataLoader(train_file: str, poi_file: str, batchsize: int):
                 neg = int(rng.integers(0, tra_len))
             data_neg.append(torch.LongTensor(_truncate_seq(train_x[neg], MAX_T, KEEP)))
 
+        # 长度
         data_length = [len(sq) for sq in data]
         neg_length = [len(sq) for sq in data_neg]
         label_length = [len(sq) for sq in data_label]
+        spatial_aug_length = [len(sq) for sq in data_spatial_aug]
+        temporal_aug_length = [len(sq) for sq in data_temporal_aug]
 
-        # POI-level pos/neg (neighbors)
+        # POI-level pos/neg
         poi_pos, poi_neg = [], []
         for traj in data:
             pos, neg = [], []
@@ -356,7 +461,7 @@ def TrainValueDataLoader(train_file: str, poi_file: str, batchsize: int):
             poi_pos.append(torch.LongTensor(pos))
             poi_neg.append(torch.LongTensor(neg))
 
-        # traj internal neighbor pos/neg
+        # traj internal
         traj_poi_pos, traj_poi_neg = [], []
         for traj in data:
             traj_list = traj.tolist()
@@ -388,15 +493,19 @@ def TrainValueDataLoader(train_file: str, poi_file: str, batchsize: int):
             traj_poi_pos.append(torch.LongTensor(pos))
             traj_poi_neg.append(torch.LongTensor(neg))
 
-        # semantic packs (CPU)
+        # semantic packs
         semantic_anchor = _build_semantic_pack(data, semantic_lookup[0], semantic_lookup[1])
         semantic_pos = _build_semantic_pack(data_label, semantic_lookup[0], semantic_lookup[1])
         semantic_neg = _build_semantic_pack(data_neg, semantic_lookup[0], semantic_lookup[1])
+        semantic_spatial_aug = _build_semantic_pack(data_spatial_aug, semantic_lookup[0], semantic_lookup[1])
+        semantic_temporal_aug = _build_semantic_pack(data_temporal_aug, semantic_lookup[0], semantic_lookup[1])
 
         # pad sequences
         data = rnn_utils.pad_sequence(data, batch_first=True, padding_value=0)
         data_label = rnn_utils.pad_sequence(data_label, batch_first=True, padding_value=0)
         data_neg = rnn_utils.pad_sequence(data_neg, batch_first=True, padding_value=0)
+        data_spatial_aug = rnn_utils.pad_sequence(data_spatial_aug, batch_first=True, padding_value=0)
+        data_temporal_aug = rnn_utils.pad_sequence(data_temporal_aug, batch_first=True, padding_value=0)
 
         traj_poi_pos_tensor = rnn_utils.pad_sequence(traj_poi_pos, batch_first=True, padding_value=0)
         traj_poi_neg_tensor = rnn_utils.pad_sequence(traj_poi_neg, batch_first=True, padding_value=0)
@@ -408,6 +517,8 @@ def TrainValueDataLoader(train_file: str, poi_file: str, batchsize: int):
         data = data.to(device)
         data_label = data_label.to(device)
         data_neg = data_neg.to(device)
+        data_spatial_aug = data_spatial_aug.to(device)
+        data_temporal_aug = data_temporal_aug.to(device)
 
         traj_poi_pos_tensor = traj_poi_pos_tensor.to(device)
         traj_poi_neg_tensor = traj_poi_neg_tensor.to(device)
@@ -417,6 +528,8 @@ def TrainValueDataLoader(train_file: str, poi_file: str, batchsize: int):
         semantic_anchor_dev = _move_semantic_pack_to_device(semantic_anchor, device)
         semantic_pos_dev = _move_semantic_pack_to_device(semantic_pos, device)
         semantic_neg_dev = _move_semantic_pack_to_device(semantic_neg, device)
+        semantic_spatial_aug_dev = _move_semantic_pack_to_device(semantic_spatial_aug, device)
+        semantic_temporal_aug_dev = _move_semantic_pack_to_device(semantic_temporal_aug, device)
 
         return (
             data, data_neg, data_label,
@@ -424,6 +537,9 @@ def TrainValueDataLoader(train_file: str, poi_file: str, batchsize: int):
             traj_poi_pos_tensor, traj_poi_neg_tensor,
             poi_pos_tensor, poi_neg_tensor,
             semantic_anchor_dev, semantic_pos_dev, semantic_neg_dev,
+            data_spatial_aug, data_temporal_aug,
+            spatial_aug_length, temporal_aug_length,
+            semantic_spatial_aug_dev, semantic_temporal_aug_dev,
         )
 
     dataset = DataLoader(
@@ -436,11 +552,6 @@ def TrainValueDataLoader(train_file: str, poi_file: str, batchsize: int):
 
 
 def TrainDataValLoader(train_file: str, batchsize: int):
-    """
-    Eval loader on train set (no pos/neg sampling).
-    Returns:
-      data, idx_global_list, data_length, idx_list, semantic_pack
-    """
     semantic_lookup = load_semantic_info(args.semantic_file, args.nodes)
     args.category_vocab, args.subclass_vocab = semantic_lookup[2], semantic_lookup[3]
     device = _auto_device()
@@ -478,11 +589,6 @@ def TrainDataValLoader(train_file: str, batchsize: int):
 
 
 def ValValueDataLoader(val_file: str, batchsize: int):
-    """
-    Val loader (no pos/neg sampling).
-    Returns:
-      data, labels(optional), data_length, idx_list, semantic_pack
-    """
     semantic_lookup = load_semantic_info(args.semantic_file, args.nodes)
     args.category_vocab, args.subclass_vocab = semantic_lookup[2], semantic_lookup[3]
     device = _auto_device()
@@ -517,7 +623,4 @@ def ValValueDataLoader(val_file: str, batchsize: int):
 
 
 def TestValueDataLoader(test_file: str, batchsize: int):
-    """
-    Test loader (same as ValValueDataLoader).
-    """
     return ValValueDataLoader(test_file, batchsize)

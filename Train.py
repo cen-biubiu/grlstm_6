@@ -38,6 +38,7 @@ def train():
         model_folder=args.save_folder,
         device=device,
         grad_accum_steps=args.grad_accum_steps,
+        aug_weight=args.aug_weight, 
 
     )
 

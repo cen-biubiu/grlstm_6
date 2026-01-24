@@ -46,8 +46,8 @@ parser.add_argument('--trans_layers',   type=int,   default=4)
 parser.add_argument('--trans_ffn_dim',  type=int,   default=512)
 parser.add_argument('--trans_dropout',  type=float, default=0.1)
 parser.add_argument('--fusion_layers',  type=int,   default=2)
-parser.add_argument('--n_epochs',       type=int,   default=4)
-parser.add_argument('--batch_size',     type=int,   default=32)
+parser.add_argument('--n_epochs',       type=int,   default=100)
+parser.add_argument('--batch_size',     type=int,   default=16)
 parser.add_argument('--lr',             type=float, default=5e-4,
                     help='5e-4 for Beijing, 1e-3 for Newyork')
 parser.add_argument('--save_epoch_int', type=int,   default=1)
@@ -55,13 +55,21 @@ parser.add_argument('--save_folder',                default='saved_models')
 parser.add_argument('--grad_accum_steps', type=int, default=1,
                     help='gradient accumulation steps')
 
-# 🔥 轨迹增强对比学习参数
+# 🔥 轨迹增强对比学习参数 (两视图增强)
 parser.add_argument('--use_augmentation', type=bool, default=True,
                     help='whether to use trajectory augmentation')
 parser.add_argument('--aug_weight', type=float, default=0.5,
                     help='weight for augmentation contrastive loss (0.3-0.8 recommended)')
 parser.add_argument('--aug_temperature', type=float, default=0.07,
                     help='temperature for augmentation InfoNCE loss')
+
+# 增强策略参数
+parser.add_argument('--aug_spatial_jitter_ratio', type=float, default=0.3,
+                    help='ratio for spatial jitter augmentation')
+parser.add_argument('--aug_temporal_interval', type=int, default=2,
+                    help='keep interval for temporal resampling (2=keep 50%)')
+parser.add_argument('--aug_subsequence_ratio', type=float, default=0.7,
+                    help='ratio for subsequence extraction')
 
 args = parser.parse_args()
 

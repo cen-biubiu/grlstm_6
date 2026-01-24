@@ -1,3 +1,4 @@
+# 改进的图对比学习
 import logging
 import os
 import numpy as np
@@ -18,7 +19,7 @@ class Trainer:
             model_folder,
             device,
             grad_accum_steps: int = 1,
-            aug_weight: float = 0.5,  # 🔥 增强对比学习权重
+            aug_weight: float = 0.5,
     ):
         self.train_data_loader = train_data_loader
         self.val_data_loader = val_data_loader
@@ -38,7 +39,7 @@ class Trainer:
             filter(lambda p: p.requires_grad, self.model.parameters()),
             lr=lr,
         )
-        
+
         logging.info(f"[Trainer] Augmentation contrastive weight: {aug_weight}")
 
     @staticmethod
@@ -72,36 +73,37 @@ class Trainer:
             return None
         sig = (pos_score - neg_score).sigmoid().clamp(min=eps)
         return -(sig.log()).mean()
-    
+
     @staticmethod
     def _infonce_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
-        """InfoNCE对比损失"""
+        """InfoNCE对比损失 (两视图对比学习)"""
         import torch.nn.functional as F
-        
+
         B = z1.size(0)
         z1 = F.normalize(z1, p=2, dim=-1)
         z2 = F.normalize(z2, p=2, dim=-1)
-        
+
         sim = torch.mm(z1, z2.t()) / temperature
         labels = torch.arange(B, device=z1.device)
-        
+
         loss_12 = F.cross_entropy(sim, labels)
         loss_21 = F.cross_entropy(sim.t(), labels)
-        
+
         return (loss_12 + loss_21) / 2
 
     def _pass(self, data, train=True):
-        # 解包 (现在包含增强数据)
-        if len(data) == 19:  # 有增强
+        # 解包 (包含两视图增强数据)
+        if len(data) == 20:  # 有增强
             (
                 batch_x, batch_n, batch_y,
                 batch_x_len, batch_n_len, batch_y_len,
                 batch_traj_poi_pos, batch_traj_poi_neg,
                 poi_pos, poi_neg,
                 semantic_anchor, semantic_pos, semantic_neg,
-                batch_x_spatial_aug, batch_x_temporal_aug,
-                spatial_aug_len, temporal_aug_len,
-                semantic_spatial_aug, semantic_temporal_aug
+                batch_x_view1, batch_x_view2,
+                view1_len, view2_len,
+                semantic_view1, semantic_view2,
+                aug_strategies,
             ) = data
             has_aug = True
         else:  # 无增强 (向后兼容)
@@ -130,7 +132,7 @@ class Trainer:
         eps = 1e-8
 
         # ==========================================================
-        # 1) traj-level对比 ✅
+        # 1) traj-level对比
         # ==========================================================
         anchor_out = self.model(batch_x, batch_x_len, semantic_anchor)
         pos_out = self.model(batch_y, batch_y_len, semantic_pos)
@@ -144,7 +146,7 @@ class Trainer:
             loss1 = torch.tensor(0.0, device=self.device)
 
         # ==========================================================
-        # 2) POI-level对比 ✅
+        # 2) POI-level对比
         # ==========================================================
         loss2 = torch.tensor(0.0, device=self.device)
         try:
@@ -173,7 +175,7 @@ class Trainer:
             logging.warning(f"[Trainer] skip loss2 (poi) due to error: {e}")
 
         # ==========================================================
-        # 3) traj-ctx-level对比 ✅
+        # 3) traj-ctx-level对比
         # ==========================================================
         loss3 = torch.tensor(0.0, device=self.device)
         try:
@@ -202,54 +204,58 @@ class Trainer:
             logging.warning(f"[Trainer] skip loss3 (traj_ctx) due to error: {e}")
 
         # ==========================================================
-        # 🔥 4) 增强对比学习 (时空增强)
+        # 🔥 4) 两视图增强对比学习
         # ==========================================================
         loss_aug = torch.tensor(0.0, device=self.device)
         loss_aug_dict = {}
-        
+
         if has_aug:
             try:
-                batch_x_spatial_aug = batch_x_spatial_aug.to(self.device)
-                batch_x_temporal_aug = batch_x_temporal_aug.to(self.device)
-                semantic_spatial_aug = {k: v.to(self.device) if torch.is_tensor(v) else v 
-                                       for k, v in semantic_spatial_aug.items()}
-                semantic_temporal_aug = {k: v.to(self.device) if torch.is_tensor(v) else v 
-                                        for k, v in semantic_temporal_aug.items()}
-                
-                # 编码增强轨迹
-                spatial_aug_out = self.model(batch_x_spatial_aug, spatial_aug_len, semantic_spatial_aug)
-                temporal_aug_out = self.model(batch_x_temporal_aug, temporal_aug_len, semantic_temporal_aug)
-                
-                # 三对对比
-                # (1) anchor vs spatial_aug
-                loss_anchor_spatial = self._infonce_loss(
-                    anchor_out["traj_repr"], 
-                    spatial_aug_out["traj_repr"],
+                batch_x_view1 = batch_x_view1.to(self.device)
+                batch_x_view2 = batch_x_view2.to(self.device)
+                semantic_view1 = {k: v.to(self.device) if torch.is_tensor(v) else v
+                                  for k, v in semantic_view1.items()}
+                semantic_view2 = {k: v.to(self.device) if torch.is_tensor(v) else v
+                                  for k, v in semantic_view2.items()}
+
+                # 编码两个增强视图
+                view1_out = self.model(batch_x_view1, view1_len, semantic_view1)
+                view2_out = self.model(batch_x_view2, view2_len, semantic_view2)
+
+                # 对比损失: anchor vs view1, anchor vs view2, view1 vs view2
+                loss_anchor_view1 = self._infonce_loss(
+                    anchor_out["traj_repr"],
+                    view1_out["traj_repr"],
                     temperature=0.07
                 )
-                
-                # (2) anchor vs temporal_aug
-                loss_anchor_temporal = self._infonce_loss(
-                    anchor_out["traj_repr"], 
-                    temporal_aug_out["traj_repr"],
+
+                loss_anchor_view2 = self._infonce_loss(
+                    anchor_out["traj_repr"],
+                    view2_out["traj_repr"],
                     temperature=0.07
                 )
-                
-                # (3) spatial_aug vs temporal_aug
-                loss_spatial_temporal = self._infonce_loss(
-                    spatial_aug_out["traj_repr"], 
-                    temporal_aug_out["traj_repr"],
+
+                loss_view1_view2 = self._infonce_loss(
+                    view1_out["traj_repr"],
+                    view2_out["traj_repr"],
                     temperature=0.07
                 )
-                
-                loss_aug = (loss_anchor_spatial + loss_anchor_temporal + loss_spatial_temporal) / 3
-                
+
+                # 总增强损失
+                loss_aug = (loss_anchor_view1 + loss_anchor_view2 + loss_view1_view2) / 3
+
                 loss_aug_dict = {
-                    'aug_anchor_spatial': float(loss_anchor_spatial.item()),
-                    'aug_anchor_temporal': float(loss_anchor_temporal.item()),
-                    'aug_spatial_temporal': float(loss_spatial_temporal.item()),
+                    'aug_anchor_v1': float(loss_anchor_view1.item()),
+                    'aug_anchor_v2': float(loss_anchor_view2.item()),
+                    'aug_v1_v2': float(loss_view1_view2.item()),
                 }
-                
+
+                # 统计增强策略使用情况
+                strategy_counts = {}
+                for s in aug_strategies:
+                    strategy_counts[s] = strategy_counts.get(s, 0) + 1
+                loss_aug_dict['strategies'] = strategy_counts
+
             except Exception as e:
                 logging.warning(f"[Trainer] skip augmentation loss due to error: {e}")
 
@@ -269,24 +275,32 @@ class Trainer:
             'aug': float(loss_aug.item()),
         }
         loss_dict.update(loss_aug_dict)
-        
+
         return loss_dict
 
     def _train_epoch(self):
         self.model.train()
         losses = []
         aug_losses = []
-        
+
         pbar = tqdm(self.train_data_loader)
         self.optim.zero_grad()
-        
+
         for step, data in enumerate(pbar, 1):
             loss_dict = self._pass(data, train=True)
             losses.append(loss_dict['total'])
             aug_losses.append(loss_dict['aug'])
-            
+
+            # 显示使用的增强策略
+            strategy_info = ""
+            if 'strategies' in loss_dict:
+                strategy_info = " | " + ", ".join(
+                    f"{k}:{v}" for k, v in loss_dict['strategies'].items()
+                )
+
             pbar.set_description(
-                "[loss: %.4f | aug: %.4f]" % (loss_dict['total'], loss_dict['aug'])
+                "[loss: %.4f | aug: %.4f%s]" %
+                (loss_dict['total'], loss_dict['aug'], strategy_info)
             )
 
             if step % self.grad_accum_steps == 0:
@@ -301,42 +315,42 @@ class Trainer:
 
         avg_loss = float(np.array(losses).mean())
         avg_aug = float(np.array(aug_losses).mean())
-        
+
         return avg_loss, avg_aug
 
     def _val_epoch(self):
         self.model.eval()
         if self.val_data_loader is None:
             return None, None
-        
+
         losses = []
         aug_losses = []
         pbar = tqdm(self.val_data_loader)
-        
+
         with torch.no_grad():
             for data in pbar:
                 loss_dict = self._pass(data, train=False)
                 losses.append(loss_dict['total'])
                 aug_losses.append(loss_dict['aug'])
                 pbar.set_description("[val_loss: %.4f]" % loss_dict['total'])
-        
+
         avg_loss = float(np.array(losses).mean()) if losses else None
         avg_aug = float(np.array(aug_losses).mean()) if aug_losses else None
-        
+
         return avg_loss, avg_aug
 
     def train(self):
         for epoch in range(self.n_epochs):
             train_loss, train_aug = self._train_epoch()
             logging.info(
-                "[Epoch %d/%d] [train loss: %.4f | aug: %.4f]" % 
+                "[Epoch %d/%d] [train loss: %.4f | aug: %.4f]" %
                 (epoch, self.n_epochs, train_loss, train_aug)
             )
 
             val_loss, val_aug = self._val_epoch()
             if val_loss is not None:
                 logging.info(
-                    "[Epoch %d/%d] [val loss: %.4f | aug: %.4f]" % 
+                    "[Epoch %d/%d] [val loss: %.4f | aug: %.4f]" %
                     (epoch, self.n_epochs, val_loss, val_aug)
                 )
 

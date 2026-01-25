@@ -1,4 +1,3 @@
-# 改进的图对比学习，考虑了四种增强方式，并且每次只使用一种
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np

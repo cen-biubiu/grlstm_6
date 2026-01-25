@@ -46,7 +46,7 @@ parser.add_argument('--trans_layers',   type=int,   default=4)
 parser.add_argument('--trans_ffn_dim',  type=int,   default=512)
 parser.add_argument('--trans_dropout',  type=float, default=0.1)
 parser.add_argument('--fusion_layers',  type=int,   default=2)
-parser.add_argument('--n_epochs',       type=int,   default=100)
+parser.add_argument('--n_epochs',       type=int,   default=200)
 parser.add_argument('--batch_size',     type=int,   default=16)
 parser.add_argument('--lr',             type=float, default=5e-4,
                     help='5e-4 for Beijing, 1e-3 for Newyork')
@@ -60,7 +60,7 @@ parser.add_argument('--use_augmentation', type=bool, default=True,
                     help='whether to use trajectory augmentation')
 parser.add_argument('--aug_weight', type=float, default=0.5,
                     help='weight for augmentation contrastive loss (0.3-0.8 recommended)')
-parser.add_argument('--aug_temperature', type=float, default=0.07,
+parser.add_argument('--aug_temperature', type=float, default=0.05,
                     help='temperature for augmentation InfoNCE loss')
 
 # 增强策略参数

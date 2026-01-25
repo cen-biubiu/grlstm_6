@@ -75,7 +75,66 @@ class Trainer:
         return -(sig.log()).mean()
 
     @staticmethod
-    def _infonce_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
+    def _triplet_loss_with_margin(
+            anchor: torch.Tensor,
+            pos: torch.Tensor,
+            neg: torch.Tensor,
+            margin: float = 0.5,  # 🔥 关键: 增大margin
+            temperature: float = 0.1  # 🔥 降低温度增强判别力
+    ) -> torch.Tensor:
+        """Triplet loss with adaptive margin"""
+        import torch.nn.functional as F
+
+        # L2 normalize
+        anchor = F.normalize(anchor, p=2, dim=-1)
+        pos = F.normalize(pos, p=2, dim=-1)
+        neg = F.normalize(neg, p=2, dim=-1)
+
+        # Cosine similarity
+        pos_sim = (anchor * pos).sum(dim=-1) / temperature
+        neg_sim = (anchor * neg).sum(dim=-1) / temperature
+
+        # Triplet loss: max(0, margin + neg_sim - pos_sim)
+        loss = F.relu(margin + neg_sim - pos_sim).mean()
+
+        return loss
+
+    @staticmethod
+    def _listwise_ranking_loss(
+            anchor: torch.Tensor,  # [B, D]
+            pos: torch.Tensor,  # [B, D]
+            neg: torch.Tensor,  # [B, D]
+            temperature: float = 0.05
+    ) -> torch.Tensor:
+        """
+        Listwise ranking loss - 强制正样本排在第一位
+        """
+        import torch.nn.functional as F
+
+        B = anchor.size(0)
+
+        # Normalize
+        anchor = F.normalize(anchor, p=2, dim=-1)
+        pos = F.normalize(pos, p=2, dim=-1)
+        neg = F.normalize(neg, p=2, dim=-1)
+
+        # Scores
+        pos_scores = (anchor * pos).sum(dim=-1, keepdim=True) / temperature  # [B, 1]
+        neg_scores = (anchor * neg).sum(dim=-1, keepdim=True) / temperature  # [B, 1]
+
+        # Concatenate [pos, neg]
+        scores = torch.cat([pos_scores, neg_scores], dim=1)  # [B, 2]
+
+        # Labels: 正样本应该排第一 (index=0)
+        labels = torch.zeros(B, dtype=torch.long, device=anchor.device)
+
+        # Cross entropy - 强制pos_score > neg_score
+        loss = F.cross_entropy(scores, labels)
+
+        return loss
+
+    @staticmethod
+    def _infonce_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float = 0.05) -> torch.Tensor:
         """InfoNCE对比损失 (两视图对比学习)"""
         import torch.nn.functional as F
 
@@ -140,7 +199,20 @@ class Trainer:
 
         pos_score_1 = self._dot_sim(anchor_out["traj_repr"], pos_out["traj_repr"])
         neg_score_1 = self._dot_sim(anchor_out["traj_repr"], neg_out["traj_repr"])
-        loss1 = self._bpr_loss(pos_score_1, neg_score_1, eps=eps)
+        # loss1 = self._bpr_loss(pos_score_1, neg_score_1, eps=eps)
+        loss1 = self._triplet_loss_with_margin(
+            anchor_out["traj_repr"],
+            pos_out["traj_repr"],
+            neg_out["traj_repr"],
+            margin=0.5,  # 可调参数: 0.3-0.8
+            temperature=0.1
+        )
+        loss_ranking = self._listwise_ranking_loss(
+            anchor_out["traj_repr"],
+            pos_out["traj_repr"],
+            neg_out["traj_repr"],
+            temperature=0.05  # 更低的温度 = 更严格的排序
+        )
 
         if loss1 is None:
             loss1 = torch.tensor(0.0, device=self.device)
@@ -204,7 +276,7 @@ class Trainer:
             logging.warning(f"[Trainer] skip loss3 (traj_ctx) due to error: {e}")
 
         # ==========================================================
-        # 🔥 4) 两视图增强对比学习
+        #  4) 两视图增强对比学习
         # ==========================================================
         loss_aug = torch.tensor(0.0, device=self.device)
         loss_aug_dict = {}
@@ -260,7 +332,7 @@ class Trainer:
                 logging.warning(f"[Trainer] skip augmentation loss due to error: {e}")
 
         # 总损失
-        loss = loss1 + loss2 + loss3 + self.aug_weight * loss_aug
+        loss = loss1 + loss2 + loss3 + self.aug_weight * loss_aug + 0.3 * loss_ranking
 
         if train:
             torch.backends.cudnn.enabled = False

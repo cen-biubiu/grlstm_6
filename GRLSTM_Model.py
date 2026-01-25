@@ -1,4 +1,3 @@
-# # 添加了图对比学习，并且使用的是两视图
 import logging
 import os
 from collections import defaultdict
@@ -47,7 +46,7 @@ class TwoViewGCL(nn.Module):
     两视图图对比学习模块
 
     视图划分:
-    - 视图1 (空间-道路): road(0), highway(7), non_highway(8)
+    - 视图1 (空间-道路): road(0), highway(7), non_highway(8)  
     - 视图2 (时间-轨迹): traj_in(1), traj_not_in(2), weekday(3), weekend(4), peak(5), offpeak(6)
     """
 
